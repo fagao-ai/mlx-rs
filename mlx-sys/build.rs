@@ -107,6 +107,11 @@ fn build_and_link_mlx_c() {
 }
 
 fn main() {
+    // The CMake project is nested beneath this Rust crate, so Cargo does not
+    // discover these native-source dependencies automatically.
+    println!("cargo:rerun-if-changed=src/mlx-c/CMakeLists.txt");
+    println!("cargo:rerun-if-changed=src/mlx-c/mlx/c/fast.cpp");
+    println!("cargo:rerun-if-changed=src/mlx-c/mlx/c/fast.h");
     build_and_link_mlx_c();
 
     // generate bindings

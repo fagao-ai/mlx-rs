@@ -3,8 +3,8 @@
 use std::ffi::CStr;
 
 use crate::error::Result;
-use crate::utils::guard::Guarded;
 use crate::utils::IntoOption;
+use crate::utils::guard::Guarded;
 use crate::{Array, Stream};
 use mlx_internal_macros::{default_device, generate_macro};
 
@@ -91,6 +91,32 @@ pub fn rope_dynamic_device<'a>(
             freqs
                 .map(|a| a.as_ptr())
                 .unwrap_or(mlx_sys::mlx_array_new()),
+            stream.as_ref().as_ptr(),
+        )
+    })
+}
+
+/// Apply PaddleOCR-VL's two-dimensional RoPE to Q and K in a packed FP32 QKV
+/// projection. The result is ordered as `[Q, K]` with shape `[2, 16, L, 72]`.
+///
+/// This is a Metal-only fused custom kernel. It expects `qkv=[L,3456]` and
+/// `cosine/sine=[L,72]` or `[L,1,72]`, preserving the model's original
+/// trigonometric inputs while avoiding the composed slice/negate/concatenate/
+/// elementwise graph.
+#[generate_macro(customize(root = "$crate::fast"))]
+#[default_device]
+pub fn paddleocr_rope_2d_qk_device(
+    qkv: impl AsRef<Array>,
+    cosine: impl AsRef<Array>,
+    sine: impl AsRef<Array>,
+    #[optional] stream: impl AsRef<Stream>,
+) -> Result<Array> {
+    Array::try_from_op(|res| unsafe {
+        mlx_sys::mlx_fast_paddleocr_rope_2d_qk(
+            res,
+            qkv.as_ref().as_ptr(),
+            cosine.as_ref().as_ptr(),
+            sine.as_ref().as_ptr(),
             stream.as_ref().as_ptr(),
         )
     })
@@ -298,6 +324,99 @@ mod tests {
         let diff = &result - &result_int_offset;
         let max_diff = diff.abs().unwrap().max(None).unwrap().item::<f32>();
         assert!(max_diff < 1e-5, "Max difference was {}", max_diff);
+    }
+
+    #[test]
+    fn test_paddleocr_rope_2d_qk_matches_composed_graph() {
+        use crate::ops::{concatenate_axis, indexing::TryIndexOp};
+
+        fn assert_matches(label: &str, fused: &Array, expected: &Array, token_count: usize) {
+            fused.eval().unwrap();
+            expected.eval().unwrap();
+            let fused_values = fused.as_slice::<f32>();
+            let expected_values = expected.as_slice::<f32>();
+            let (flat_index, max_difference) = fused_values
+                .iter()
+                .zip(expected_values)
+                .enumerate()
+                .map(|(index, (actual, expected))| (index, (actual - expected).abs()))
+                .max_by(|(_, left), (_, right)| left.total_cmp(right))
+                .unwrap();
+            let per_kind = 16 * token_count * 72;
+            let kind = flat_index / per_kind;
+            let within_kind = flat_index % per_kind;
+            let head = within_kind / (token_count * 72);
+            let within_head = within_kind % (token_count * 72);
+            let token = within_head / 72;
+            let dim = within_head % 72;
+            assert!(
+                max_difference < 1e-5,
+                "{label}: max difference was {max_difference} at \
+                 [kind={kind}, head={head}, token={token}, dim={dim}] \
+                 (fused={}, expected={})",
+                fused_values[flat_index],
+                expected_values[flat_index],
+            );
+        }
+
+        let token_count = 2_i32;
+        let qkv_values = (0..token_count * 3456)
+            .map(|value| value as f32 * 0.001 - 2.0)
+            .collect::<Vec<_>>();
+        let cosine_values = (0..token_count * 72)
+            .map(|value| 0.25 + value as f32 * 0.0001)
+            .collect::<Vec<_>>();
+        let sine_values = (0..token_count * 72)
+            .map(|value| -0.5 + value as f32 * 0.0002)
+            .collect::<Vec<_>>();
+        let qkv = Array::from_slice(&qkv_values, &[token_count, 3456]);
+        let cosine_input = Array::from_slice(&cosine_values, &[token_count, 1, 72]);
+        let sine_input = Array::from_slice(&sine_values, &[token_count, 1, 72]);
+
+        let qk = qkv
+            .try_index((.., 0..2304))
+            .unwrap()
+            .reshape(&[token_count, 2, 16, 72])
+            .unwrap()
+            .transpose_axes(&[1, 2, 0, 3])
+            .unwrap();
+        let first = qk.try_index((.., .., .., 0..36)).unwrap();
+        let second = qk.try_index((.., .., .., 36..72)).unwrap();
+        let rotated = concatenate_axis(&[&(-&second), &first], -1).unwrap();
+        let cosine = cosine_input.reshape(&[1, 1, token_count, 72]).unwrap();
+        let sine = sine_input.reshape(&[1, 1, token_count, 72]).unwrap();
+        let composed = &qk * &cosine + &rotated * &sine;
+
+        let fused = paddleocr_rope_2d_qk(&qkv, &cosine_input, &sine_input).unwrap();
+        assert_matches("general rotation", &fused, &composed, token_count as usize);
+
+        let identity_cosine = Array::ones::<f32>(&[token_count, 1, 72]).unwrap();
+        let identity_sine = Array::zeros::<f32>(&[token_count, 1, 72]).unwrap();
+        let identity_cosine_broadcast = identity_cosine.reshape(&[1, 1, token_count, 72]).unwrap();
+        let identity_sine_broadcast = identity_sine.reshape(&[1, 1, token_count, 72]).unwrap();
+        let identity_expected =
+            &qk * &identity_cosine_broadcast + &rotated * &identity_sine_broadcast;
+        let identity_fused = paddleocr_rope_2d_qk(&qkv, &identity_cosine, &identity_sine).unwrap();
+        assert_matches(
+            "identity rotation",
+            &identity_fused,
+            &identity_expected,
+            token_count as usize,
+        );
+
+        let rotation_cosine = Array::zeros::<f32>(&[token_count, 1, 72]).unwrap();
+        let rotation_sine = Array::ones::<f32>(&[token_count, 1, 72]).unwrap();
+        let rotation_cosine_broadcast = rotation_cosine.reshape(&[1, 1, token_count, 72]).unwrap();
+        let rotation_sine_broadcast = rotation_sine.reshape(&[1, 1, token_count, 72]).unwrap();
+        let rotation_expected =
+            &qk * &rotation_cosine_broadcast + &rotated * &rotation_sine_broadcast;
+        let rotation_fused = paddleocr_rope_2d_qk(&qkv, &rotation_cosine, &rotation_sine).unwrap();
+        assert_matches(
+            "pure rotation",
+            &rotation_fused,
+            &rotation_expected,
+            token_count as usize,
+        );
     }
 
     #[test]
