@@ -1492,6 +1492,41 @@ pub fn addmm_device(
     })
 }
 
+/// Matrix multiplication with bias and approximate GELU fused into MLX's
+/// Metal Steel GEMM epilogue.
+///
+/// This inference-only operation requires a non-empty FP32 GEMM on Metal.
+/// It avoids materializing the intermediate result between the projection and
+/// the approximate GELU activation.
+#[generate_macro]
+#[default_device]
+pub fn addmm_gelu_approximate_device(
+    c: impl AsRef<Array>,
+    a: impl AsRef<Array>,
+    b: impl AsRef<Array>,
+    #[optional] alpha: impl Into<Option<f32>>,
+    #[optional] beta: impl Into<Option<f32>>,
+    #[optional] stream: impl AsRef<Stream>,
+) -> Result<Array> {
+    let c_ptr = c.as_ref().as_ptr();
+    let a_ptr = a.as_ref().as_ptr();
+    let b_ptr = b.as_ref().as_ptr();
+    let alpha = alpha.into().unwrap_or(1.0);
+    let beta = beta.into().unwrap_or(1.0);
+
+    Array::try_from_op(|res| unsafe {
+        mlx_sys::mlx_addmm_gelu_approximate(
+            res,
+            c_ptr,
+            a_ptr,
+            b_ptr,
+            alpha,
+            beta,
+            stream.as_ref().as_ptr(),
+        )
+    })
+}
+
 /// Ordinary inner product of vectors for 1-D arrays, in higher dimensions a sum product over the
 /// last axes.
 #[generate_macro]
