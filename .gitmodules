@@ -1,4 +1,4 @@
 [submodule "mlx-sys/src/mlx-c"]
 	path = mlx-sys/src/mlx-c
-	url = git@github-kitty.com:fagao-ai/mlx-c.git
+	url = https://github.com/fagao-ai/mlx-c.git
 	branch = codex/paddleocr-vl
