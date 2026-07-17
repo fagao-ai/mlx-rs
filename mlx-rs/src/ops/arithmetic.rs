@@ -1495,7 +1495,8 @@ pub fn addmm_device(
 /// Matrix multiplication with bias and approximate GELU fused into MLX's
 /// Metal Steel GEMM epilogue.
 ///
-/// This inference-only operation requires a non-empty FP32 GEMM on Metal.
+/// This inference-only operation requires a non-empty FP32, FP16, or BF16 GEMM
+/// on Metal.
 /// It avoids materializing the intermediate result between the projection and
 /// the approximate GELU activation.
 #[generate_macro]
@@ -2098,6 +2099,42 @@ mod tests {
 
         let b_data: &[f32] = b.as_slice();
         assert_eq!(b_data, &[-5.0, 37.5, 4., 7., 1., 0.]);
+    }
+
+    #[test]
+    fn test_addmm_gelu_approximate_accepts_low_precision_inputs() {
+        let input = Array::from_slice(
+            &[-0.5_f32, -0.25, 0.25, 0.5, 0.75, 0.5, -0.5, -0.75],
+            &[2, 4],
+        );
+        let weight = Array::from_slice(
+            &[
+                0.25_f32, 0.5, -0.5, -0.25, -0.25, 0.25, 0.5, -0.5, 0.5, -0.25, 0.25, 0.5, -0.5,
+                0.5, -0.25, 0.25,
+            ],
+            &[4, 4],
+        );
+        let bias = Array::from_slice(&[0.25_f32, -0.25, 0.5, -0.5], &[4]);
+
+        for dtype in [Dtype::Float16, Dtype::Bfloat16] {
+            let output = addmm_gelu_approximate(
+                bias.as_dtype(dtype).unwrap(),
+                input.as_dtype(dtype).unwrap(),
+                weight.as_dtype(dtype).unwrap(),
+                None,
+                None,
+            )
+            .unwrap();
+            assert_eq!(output.shape(), [2, 4]);
+            assert_eq!(output.dtype(), dtype);
+
+            let output = output.as_dtype(Dtype::Float32).unwrap();
+            output.eval().unwrap();
+            assert!(output
+                .as_slice::<f32>()
+                .iter()
+                .all(|value| value.is_finite()));
+        }
     }
 
     #[test]

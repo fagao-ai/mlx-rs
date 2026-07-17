@@ -112,6 +112,11 @@ fn main() {
     println!("cargo:rerun-if-changed=src/mlx-c/CMakeLists.txt");
     println!("cargo:rerun-if-changed=src/mlx-c/mlx/c/fast.cpp");
     println!("cargo:rerun-if-changed=src/mlx-c/mlx/c/fast.h");
+    println!("cargo:rerun-if-changed=src/mlx-c/patches/apply-patches.sh");
+    println!("cargo:rerun-if-changed=src/mlx-c/patches/mlx-sdpa-head-dim-72.patch");
+    println!("cargo:rerun-if-changed=src/mlx-c/patches/mlx-shapeless-split-output-shapes.patch");
+    println!("cargo:rerun-if-changed=src/mlx-c/patches/mlx-addmm-gelu-experiment.patch");
+    println!("cargo:rerun-if-changed=src/mlx-c/patches/mlx-addmm-gelu-api.patch");
     build_and_link_mlx_c();
 
     // generate bindings

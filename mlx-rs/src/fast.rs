@@ -3,8 +3,8 @@
 use std::ffi::CStr;
 
 use crate::error::Result;
-use crate::utils::IntoOption;
 use crate::utils::guard::Guarded;
+use crate::utils::IntoOption;
 use crate::{Array, Stream};
 use mlx_internal_macros::{default_device, generate_macro};
 
@@ -96,13 +96,13 @@ pub fn rope_dynamic_device<'a>(
     })
 }
 
-/// Apply PaddleOCR-VL's two-dimensional RoPE to Q and K in a packed FP32 QKV
+/// Apply PaddleOCR-VL's two-dimensional RoPE to Q and K in a packed QKV
 /// projection. The result is ordered as `[Q, K]` with shape `[2, 16, L, 72]`.
 ///
-/// This is a Metal-only fused custom kernel. It expects `qkv=[L,3456]` and
-/// `cosine/sine=[L,72]` or `[L,1,72]`, preserving the model's original
-/// trigonometric inputs while avoiding the composed slice/negate/concatenate/
-/// elementwise graph.
+/// This is a Metal-only fused custom kernel. It accepts matching FP32, FP16,
+/// or BF16 `qkv=[L,3456]` and `cosine/sine=[L,72]` or `[L,1,72]`, preserving
+/// the model's original trigonometric inputs while avoiding the composed
+/// slice/negate/concatenate/elementwise graph.
 #[generate_macro(customize(root = "$crate::fast"))]
 #[default_device]
 pub fn paddleocr_rope_2d_qk_device(
@@ -417,6 +417,37 @@ mod tests {
             &rotation_expected,
             token_count as usize,
         );
+    }
+
+    #[test]
+    fn test_paddleocr_rope_2d_qk_accepts_low_precision_inputs() {
+        let token_count = 2_i32;
+        let qkv = Array::from_slice(
+            &(0..token_count * 3456)
+                .map(|value| value as f32 * 0.001 - 2.0)
+                .collect::<Vec<_>>(),
+            &[token_count, 3456],
+        );
+        let cosine = Array::ones::<f32>(&[token_count, 1, 72]).unwrap();
+        let sine = Array::full::<f32>(&[token_count, 1, 72], crate::array!(0.125)).unwrap();
+
+        for dtype in [crate::Dtype::Float16, crate::Dtype::Bfloat16] {
+            let output = paddleocr_rope_2d_qk(
+                qkv.as_dtype(dtype).unwrap(),
+                cosine.as_dtype(dtype).unwrap(),
+                sine.as_dtype(dtype).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(output.shape(), [2, 16, token_count, 72]);
+            assert_eq!(output.dtype(), dtype);
+
+            let output = output.as_dtype(crate::Dtype::Float32).unwrap();
+            output.eval().unwrap();
+            assert!(output
+                .as_slice::<f32>()
+                .iter()
+                .all(|value| value.is_finite()));
+        }
     }
 
     #[test]
