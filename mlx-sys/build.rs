@@ -1,7 +1,13 @@
 extern crate cmake;
 
 use cmake::Config;
-use std::{env, path::PathBuf, process::Command};
+use std::{
+    env, fs,
+    path::{Path, PathBuf},
+    process::Command,
+};
+
+const MAX_JIT_METALLIB_SIZE: u64 = 16 * 1024 * 1024;
 
 /// Find the clang runtime library path dynamically using xcrun
 fn find_clang_rt_path() -> Option<String> {
@@ -44,7 +50,7 @@ fn find_clang_rt_path() -> Option<String> {
     None
 }
 
-fn build_and_link_mlx_c() {
+fn build_and_link_mlx_c() -> PathBuf {
     let mut config = Config::new("src/mlx-c");
     config.very_verbose(true);
     config.define("CMAKE_INSTALL_PREFIX", ".");
@@ -65,6 +71,8 @@ fn build_and_link_mlx_c() {
 
     config.define("MLX_BUILD_METAL", "OFF");
     config.define("MLX_BUILD_ACCELERATE", "OFF");
+    config.define("MLX_BUILD_GGUF", "OFF");
+    config.define("MLX_METAL_JIT", "ON");
 
     #[cfg(feature = "metal")]
     {
@@ -104,6 +112,60 @@ fn build_and_link_mlx_c() {
         println!("cargo:rustc-link-search={}", clang_rt_path);
         println!("cargo:rustc-link-lib=static=clang_rt.osx");
     }
+
+    dst
+}
+
+#[cfg(feature = "metal")]
+fn embed_mlx_metallib(dst: &Path, out_path: &Path) {
+    let metallib_path = dst.join("build/lib/mlx.metallib");
+    let metallib_size = fs::metadata(&metallib_path)
+        .unwrap_or_else(|error| {
+            panic!(
+                "failed to read generated MLX metallib {}: {error}",
+                metallib_path.display()
+            )
+        })
+        .len();
+    assert!(
+        metallib_size > 0,
+        "generated MLX metallib is empty: {}",
+        metallib_path.display()
+    );
+    assert!(
+        metallib_size <= MAX_JIT_METALLIB_SIZE,
+        "generated MLX metallib is {metallib_size} bytes, expected a JIT metallib no larger than {MAX_JIT_METALLIB_SIZE} bytes: {}",
+        metallib_path.display()
+    );
+
+    let escaped_metallib_path = metallib_path
+        .to_string_lossy()
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"");
+    let assembly_path = out_path.join("embedded_metallib.S");
+    let assembly = format!(
+        ".section __TEXT,__mlx_metal\n\
+         .balign 16\n\
+         .globl _mlx_embedded_metallib_start\n\
+         _mlx_embedded_metallib_start:\n\
+         .incbin \"{escaped_metallib_path}\"\n\
+         .globl _mlx_embedded_metallib_end\n\
+         _mlx_embedded_metallib_end:\n\
+         .subsections_via_symbols\n\
+         .no_dead_strip _mlx_embedded_metallib_start\n"
+    );
+    fs::write(&assembly_path, assembly).unwrap_or_else(|error| {
+        panic!(
+            "failed to write embedded metallib assembly {}: {error}",
+            assembly_path.display()
+        )
+    });
+    cc::Build::new()
+        .cargo_metadata(false)
+        .file(&assembly_path)
+        .compile("mlx_metallib");
+    println!("cargo:rustc-link-search=native={}", out_path.display());
+    println!("cargo:rustc-link-lib=static:+whole-archive=mlx_metallib");
 }
 
 fn main() {
@@ -117,7 +179,11 @@ fn main() {
     println!("cargo:rerun-if-changed=src/mlx-c/patches/mlx-shapeless-split-output-shapes.patch");
     println!("cargo:rerun-if-changed=src/mlx-c/patches/mlx-addmm-gelu-experiment.patch");
     println!("cargo:rerun-if-changed=src/mlx-c/patches/mlx-addmm-gelu-api.patch");
-    build_and_link_mlx_c();
+    let dst = build_and_link_mlx_c();
+
+    let out_path = PathBuf::from(env::var("OUT_DIR").unwrap());
+    #[cfg(feature = "metal")]
+    embed_mlx_metallib(&dst, &out_path);
 
     // generate bindings
     let bindings = bindgen::Builder::default()
@@ -132,7 +198,6 @@ fn main() {
         .expect("Unable to generate bindings");
 
     // Write the bindings to the $OUT_DIR/bindings.rs file.
-    let out_path = PathBuf::from(env::var("OUT_DIR").unwrap());
     bindings
         .write_to_file(out_path.join("bindings.rs"))
         .expect("Couldn't write bindings!");
