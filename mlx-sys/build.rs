@@ -179,6 +179,7 @@ fn main() {
     println!("cargo:rerun-if-changed=src/mlx-c/patches/mlx-shapeless-split-output-shapes.patch");
     println!("cargo:rerun-if-changed=src/mlx-c/patches/mlx-addmm-gelu-experiment.patch");
     println!("cargo:rerun-if-changed=src/mlx-c/patches/mlx-addmm-gelu-api.patch");
+    println!("cargo:rerun-if-changed=src/mlx-c/patches/mlx-precise-power.patch");
     let dst = build_and_link_mlx_c();
 
     let out_path = PathBuf::from(env::var("OUT_DIR").unwrap());
