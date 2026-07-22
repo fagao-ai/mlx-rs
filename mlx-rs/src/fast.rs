@@ -8,6 +8,17 @@ use crate::utils::IntoOption;
 use crate::{Array, Stream};
 use mlx_internal_macros::{default_device, generate_macro};
 
+/// Compute `silu(gate) * x` with a process-wide shapeless compiled function.
+///
+/// Unlike [`crate::transforms::compile::compile`], this helper preserves the
+/// compiled closure across calls, matching Python's module-level `@mx.compile`
+/// behavior for decode-heavy inference.
+pub fn compiled_swiglu(gate: impl AsRef<Array>, x: impl AsRef<Array>) -> Result<Array> {
+    Array::try_from_op(|res| unsafe {
+        mlx_sys::mlx_fast_compiled_swiglu(res, gate.as_ref().as_ptr(), x.as_ref().as_ptr())
+    })
+}
+
 /// Optimized implementation of `NN.RoPE`.
 #[allow(clippy::too_many_arguments)]
 #[generate_macro(customize(root = "$crate::fast"))]
@@ -278,6 +289,23 @@ mod tests {
     };
     use float_eq::assert_float_eq;
     use pretty_assertions::assert_eq;
+
+    #[test]
+    fn test_compiled_swiglu_matches_eager_graph_across_shapes() {
+        let gate = Array::from_slice(&[-2.0_f32, -0.5, 0.0, 1.0, 3.0, 4.0], &[2, 3]);
+        let x = Array::from_slice(&[0.5_f32, -1.0, 2.0, -3.0, 1.5, 0.25], &[2, 3]);
+        let expected = &(&gate * &crate::ops::sigmoid(&gate).unwrap()) * &x;
+        let result = compiled_swiglu(&gate, &x).unwrap();
+        crate::assert_array_eq!(result, expected, 1e-6);
+
+        // The compiled closure is shapeless, so a later invocation can reuse
+        // it with a different sequence length.
+        let gate = Array::from_slice(&[-1.0_f32, 0.5, 2.0, 5.0], &[1, 4]);
+        let x = Array::from_slice(&[3.0_f32, -2.0, 0.25, 1.5], &[1, 4]);
+        let expected = &(&gate * &crate::ops::sigmoid(&gate).unwrap()) * &x;
+        let result = compiled_swiglu(&gate, &x).unwrap();
+        crate::assert_array_eq!(result, expected, 1e-6);
+    }
 
     #[test]
     fn test_rope() {
