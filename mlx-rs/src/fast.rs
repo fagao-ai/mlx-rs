@@ -19,6 +19,31 @@ pub fn compiled_swiglu(gate: impl AsRef<Array>, x: impl AsRef<Array>) -> Result<
     })
 }
 
+/// Compute `argmax(hidden @ embedding.T)` without materializing full logits.
+///
+/// The GPU path follows MLX's GEMV accumulation and output rounding order for
+/// matching FP32, FP16, or BF16 inputs. CPU streams use the equivalent MLX
+/// graph without materializing logits outside the helper.
+///
+/// `hidden` must contain exactly one vector. `embedding` must be rank 2 with
+/// at least 8192 rows and a row count divisible by 32.
+#[generate_macro(customize(root = "$crate::fast"))]
+#[default_device]
+pub fn lm_head_argmax_device(
+    hidden: impl AsRef<Array>,
+    embedding: impl AsRef<Array>,
+    #[optional] stream: impl AsRef<Stream>,
+) -> Result<Array> {
+    Array::try_from_op(|res| unsafe {
+        mlx_sys::mlx_fast_lm_head_argmax(
+            res,
+            hidden.as_ref().as_ptr(),
+            embedding.as_ref().as_ptr(),
+            stream.as_ref().as_ptr(),
+        )
+    })
+}
+
 /// Optimized implementation of `NN.RoPE`.
 #[allow(clippy::too_many_arguments)]
 #[generate_macro(customize(root = "$crate::fast"))]
@@ -284,8 +309,9 @@ pub fn layer_norm_device<'a>(
 mod tests {
     use super::*;
     use crate::{
-        ops::indexing::{ArrayIndexOp, IndexOp},
+        ops::indexing::{argmax_axis, argmax_axis_device, ArrayIndexOp, IndexOp},
         random::normal,
+        Dtype, Stream,
     };
     use float_eq::assert_float_eq;
     use pretty_assertions::assert_eq;
@@ -305,6 +331,62 @@ mod tests {
         let expected = &(&gate * &crate::ops::sigmoid(&gate).unwrap()) * &x;
         let result = compiled_swiglu(&gate, &x).unwrap();
         crate::assert_array_eq!(result, expected, 1e-6);
+    }
+
+    fn lm_head_test_inputs() -> (Array, Array, i32) {
+        const HIDDEN_SIZE: i32 = 128;
+        const VOCAB_SIZE: i32 = 49_152;
+        const EXPECTED_TOKEN: i32 = 31_337;
+
+        let mut hidden_values = vec![0.0_f32; HIDDEN_SIZE as usize];
+        hidden_values[0] = 1.0;
+        hidden_values[1] = -0.5;
+        let mut embedding_values = vec![0.0_f32; (VOCAB_SIZE * HIDDEN_SIZE) as usize];
+        let row = EXPECTED_TOKEN as usize * HIDDEN_SIZE as usize;
+        embedding_values[row] = 2.0;
+        embedding_values[row + 1] = -1.0;
+
+        (
+            Array::from_slice(&hidden_values, &[1, 1, HIDDEN_SIZE]),
+            Array::from_slice(&embedding_values, &[VOCAB_SIZE, HIDDEN_SIZE]),
+            EXPECTED_TOKEN,
+        )
+    }
+
+    #[test]
+    fn test_lm_head_argmax_matches_bf16_gpu_graph() {
+        let (hidden, embedding, expected_token) = lm_head_test_inputs();
+        let hidden = hidden.as_dtype(Dtype::Bfloat16).unwrap();
+        let embedding = embedding.as_dtype(Dtype::Bfloat16).unwrap();
+        let logits = crate::ops::matmul(&hidden, embedding.t()).unwrap();
+        let expected = argmax_axis(&logits, -1, None)
+            .unwrap()
+            .as_dtype(Dtype::Int32)
+            .unwrap();
+        let actual = lm_head_argmax(&hidden, &embedding).unwrap();
+
+        assert_eq!(actual.shape(), [1]);
+        assert_eq!(actual.dtype(), Dtype::Int32);
+        assert_eq!(actual.item::<i32>(), expected_token);
+        assert_eq!(actual.item::<i32>(), expected.item::<i32>());
+    }
+
+    #[test]
+    fn test_lm_head_argmax_cpu_fallback_matches_graph() {
+        let (hidden, embedding, expected_token) = lm_head_test_inputs();
+        let stream = Stream::cpu();
+        let embedding_t = embedding.transpose_device(&stream).unwrap();
+        let logits = hidden.matmul_device(&embedding_t, &stream).unwrap();
+        let expected = argmax_axis_device(&logits, -1, None, &stream)
+            .unwrap()
+            .as_dtype_device(Dtype::Int32, &stream)
+            .unwrap();
+        let actual = lm_head_argmax_device(&hidden, &embedding, &stream).unwrap();
+
+        assert_eq!(actual.shape(), [1]);
+        assert_eq!(actual.dtype(), Dtype::Int32);
+        assert_eq!(actual.item::<i32>(), expected_token);
+        assert_eq!(actual.item::<i32>(), expected.item::<i32>());
     }
 
     #[test]
