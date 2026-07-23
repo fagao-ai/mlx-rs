@@ -44,6 +44,94 @@ pub fn lm_head_argmax_device(
     })
 }
 
+/// Compute a single-vector row-major matrix product with a fixed SmolLM tile.
+///
+/// `weight` is `[N, K]`, while `input` must contain one K-element vector.
+/// `residual`, when present, must contain N elements. The Metal kernel accepts
+/// one or four output rows per SIMD group so the two launch layouts can be
+/// benchmarked without rebuilding MLX.
+#[generate_macro(customize(root = "$crate::fast"))]
+#[default_device]
+pub fn smollm_gemv_device<'a>(
+    input: impl AsRef<Array>,
+    weight: impl AsRef<Array>,
+    results_per_simdgroup: i32,
+    #[optional] residual: impl Into<Option<&'a Array>>,
+    #[optional] stream: impl AsRef<Stream>,
+) -> Result<Array> {
+    let residual = residual.into();
+    Array::try_from_op(|res| unsafe {
+        mlx_sys::mlx_fast_smollm_gemv(
+            res,
+            input.as_ref().as_ptr(),
+            weight.as_ref().as_ptr(),
+            residual
+                .map(|array| array.as_ptr())
+                .unwrap_or(mlx_sys::mlx_array_new()),
+            results_per_simdgroup,
+            stream.as_ref().as_ptr(),
+        )
+    })
+}
+
+/// Fuse SmolLM's one-token YaRN scale and RoPE for Q/K and pack K/V.
+///
+/// Returns `(rotated_queries, packed_kv)`, where packed KV has shape
+/// `[2, B, kv_heads, 1, 64]`. This specialization requires FP32 frequencies.
+#[generate_macro(customize(root = "$crate::fast"))]
+#[default_device]
+pub fn smollm_yarn_rope_qkv_device(
+    queries: impl AsRef<Array>,
+    keys: impl AsRef<Array>,
+    values: impl AsRef<Array>,
+    freqs: impl AsRef<Array>,
+    attention_factor: f32,
+    offset: i32,
+    #[optional] stream: impl AsRef<Stream>,
+) -> Result<(Array, Array)> {
+    <(Array, Array)>::try_from_op(|(queries_res, packed_kv_res)| unsafe {
+        mlx_sys::mlx_fast_smollm_yarn_rope_qkv(
+            queries_res,
+            packed_kv_res,
+            queries.as_ref().as_ptr(),
+            keys.as_ref().as_ptr(),
+            values.as_ref().as_ptr(),
+            freqs.as_ref().as_ptr(),
+            attention_factor,
+            offset,
+            stream.as_ref().as_ptr(),
+        )
+    })
+}
+
+/// Fuse SmolLM's one-token YaRN scale and RoPE for Q/K.
+///
+/// Returns `(rotated_queries, rotated_keys)`. This specialization requires
+/// FP32 frequencies and preserves MLX's low-precision scaling order.
+#[generate_macro(customize(root = "$crate::fast"))]
+#[default_device]
+pub fn smollm_yarn_rope_qk_device(
+    queries: impl AsRef<Array>,
+    keys: impl AsRef<Array>,
+    freqs: impl AsRef<Array>,
+    attention_factor: f32,
+    offset: i32,
+    #[optional] stream: impl AsRef<Stream>,
+) -> Result<(Array, Array)> {
+    <(Array, Array)>::try_from_op(|(queries_res, keys_res)| unsafe {
+        mlx_sys::mlx_fast_smollm_yarn_rope_qk(
+            queries_res,
+            keys_res,
+            queries.as_ref().as_ptr(),
+            keys.as_ref().as_ptr(),
+            freqs.as_ref().as_ptr(),
+            attention_factor,
+            offset,
+            stream.as_ref().as_ptr(),
+        )
+    })
+}
+
 /// Optimized implementation of `NN.RoPE`.
 #[allow(clippy::too_many_arguments)]
 #[generate_macro(customize(root = "$crate::fast"))]
@@ -309,6 +397,7 @@ pub fn layer_norm_device<'a>(
 mod tests {
     use super::*;
     use crate::{
+        ops,
         ops::indexing::{argmax_axis, argmax_axis_device, ArrayIndexOp, IndexOp},
         random::normal,
         Dtype, Stream,
@@ -387,6 +476,111 @@ mod tests {
         assert_eq!(actual.dtype(), Dtype::Int32);
         assert_eq!(actual.item::<i32>(), expected_token);
         assert_eq!(actual.item::<i32>(), expected.item::<i32>());
+    }
+
+    fn deterministic_array(shape: &[i32], dtype: Dtype) -> Array {
+        let size = shape.iter().map(|&dimension| dimension as usize).product();
+        let values = (0..size)
+            .map(|index| {
+                let value = ((index * 37 + 11) % 251) as f32 - 125.0;
+                value / 128.0
+            })
+            .collect::<Vec<_>>();
+        Array::from_slice(&values, shape).as_dtype(dtype).unwrap()
+    }
+
+    fn assert_arrays_exact(actual: &Array, expected: &Array) {
+        assert_eq!(actual.shape(), expected.shape());
+        assert_eq!(actual.dtype(), expected.dtype());
+        assert!(
+            actual.array_eq(expected, None).unwrap().item::<bool>(),
+            "arrays differ for shape {:?} and dtype {:?}",
+            actual.shape(),
+            actual.dtype()
+        );
+    }
+
+    #[test]
+    fn test_smollm_gemv_matches_mlx_for_model_projection_shapes() {
+        for dtype in [Dtype::Float32, Dtype::Float16, Dtype::Bfloat16] {
+            for (input_size, output_size) in [(576, 1536), (960, 2560)] {
+                let input = deterministic_array(&[1, 1, input_size], dtype);
+                let weight = deterministic_array(&[output_size, input_size], dtype);
+                let residual = deterministic_array(&[1, 1, output_size], dtype);
+                let expected = ops::matmul(&input, weight.t()).unwrap();
+                let expected_add = ops::addmm(&residual, &input, weight.t(), None, None).unwrap();
+
+                for results_per_simdgroup in [1, 4] {
+                    let actual = smollm_gemv(&input, &weight, results_per_simdgroup, None).unwrap();
+                    assert_arrays_exact(&actual, &expected);
+
+                    let actual_add =
+                        smollm_gemv(&input, &weight, results_per_simdgroup, Some(&residual))
+                            .unwrap();
+                    assert_arrays_exact(&actual_add, &expected_add);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_smollm_yarn_rope_qkv_matches_standard_graph() {
+        let frequencies = Array::from_slice(
+            &(0..32)
+                .map(|index| 100_000.0_f32.powf(index as f32 / 32.0))
+                .collect::<Vec<_>>(),
+            &[32],
+        );
+        let attention_factor = 1.069_314_7_f32;
+        let offset = 8191;
+
+        for dtype in [Dtype::Float32, Dtype::Float16, Dtype::Bfloat16] {
+            let queries = deterministic_array(&[1, 9, 1, 64], dtype);
+            let keys = deterministic_array(&[1, 3, 1, 64], dtype);
+            let values = deterministic_array(&[1, 3, 1, 64], dtype);
+            let factor = Array::from_f32(attention_factor).as_dtype(dtype).unwrap();
+            let scaled_queries = &queries * &factor;
+            let scaled_keys = &keys * &factor;
+            let expected_queries = rope(
+                &scaled_queries,
+                64,
+                false,
+                None,
+                1.0,
+                offset,
+                Some(&frequencies),
+            )
+            .unwrap();
+            let expected_keys = rope(
+                &scaled_keys,
+                64,
+                false,
+                None,
+                1.0,
+                offset,
+                Some(&frequencies),
+            )
+            .unwrap();
+            let expected_packed = ops::stack_axis(&[&expected_keys, &values], 0).unwrap();
+
+            let (actual_queries, actual_packed) = smollm_yarn_rope_qkv(
+                &queries,
+                &keys,
+                &values,
+                &frequencies,
+                attention_factor,
+                offset,
+            )
+            .unwrap();
+            assert_arrays_exact(&actual_queries, &expected_queries);
+            assert_arrays_exact(&actual_packed, &expected_packed);
+
+            let (actual_queries, actual_keys) =
+                smollm_yarn_rope_qk(&queries, &keys, &frequencies, attention_factor, offset)
+                    .unwrap();
+            assert_arrays_exact(&actual_queries, &expected_queries);
+            assert_arrays_exact(&actual_keys, &expected_keys);
+        }
     }
 
     #[test]
